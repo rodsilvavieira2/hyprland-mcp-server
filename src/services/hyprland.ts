@@ -1,6 +1,6 @@
 /**
- * Hyprland IPC service — wraps hyprctl and grim to query window state
- * and capture screenshots. All operations are read-only (no compositor mutations).
+ * Hyprland IPC service — wraps hyprctl, grim, wtype, and ydotool to query
+ * window state, capture screenshots, and simulate keyboard/mouse input.
  */
 
 import { execSync, execFileSync } from "child_process";
@@ -15,6 +15,9 @@ import type {
   MonitorInfo,
   WorkspaceInfo,
   ScreenshotResult,
+  CursorPos,
+  ClickResult,
+  InputResult,
 } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -292,4 +295,218 @@ export function checkDependencies(): { ok: boolean; missing: string[] } {
   }
 
   return { ok: missing.length === 0, missing };
+}
+
+/** Checks whether optional input binaries (wtype, ydotool) are available. */
+export function checkInputDependencies(): { wtype: boolean; ydotool: boolean } {
+  const has = (bin: string): boolean => {
+    try {
+      execSync(`which ${bin}`, { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return { wtype: has("wtype"), ydotool: has("ydotool") };
+}
+
+// ---------------------------------------------------------------------------
+// Input helpers
+// ---------------------------------------------------------------------------
+
+function runHyprctlDispatch(dispatcher: string, args: string): void {
+  try {
+    execFileSync("hyprctl", ["dispatch", dispatcher, args], {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`hyprctl dispatch ${dispatcher} failed: ${msg}`);
+  }
+}
+
+function runWtype(args: string[]): void {
+  try {
+    execFileSync("wtype", args, {
+      encoding: "utf8",
+      env: { ...process.env, WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY ?? "wayland-1" },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `wtype failed: ${msg}. Ensure WAYLAND_DISPLAY is set and wtype is installed (pacman -S wtype).`
+    );
+  }
+}
+
+function runYdotool(args: string[]): void {
+  try {
+    execFileSync("ydotool", args, {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `ydotool failed: ${msg}. Ensure ydotoold daemon is running and ydotool is installed (pacman -S ydotool).`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public input API
+// ---------------------------------------------------------------------------
+
+/** Returns the current cursor position in global layout coordinates. */
+export function getCursorPos(): CursorPos {
+  const raw = JSON.parse(runHyprctl("cursorpos")) as { x: number; y: number };
+  return { x: raw.x, y: raw.y };
+}
+
+/**
+ * Moves the cursor to absolute global coordinates.
+ * Uses hyprctl dispatch movecursor.
+ */
+export function moveCursor(x: number, y: number): CursorPos {
+  runHyprctlDispatch("movecursor", `${x} ${y}`);
+  return { x, y };
+}
+
+/**
+ * Focuses a window by address, class, title or pid.
+ * Uses hyprctl dispatch focuswindow.
+ */
+export function focusWindow(opts: {
+  address?: string;
+  class?: string;
+  title?: string;
+  pid?: number;
+}): InputResult {
+  const win = findWindow(opts);
+
+  // Build focuswindow argument — address is most reliable
+  const arg = `address:${win.address}`;
+  runHyprctlDispatch("focuswindow", arg);
+
+  return {
+    success: true,
+    action: "focus_window",
+    detail: `Focused window "${win.class}" (${win.title}) at address ${win.address}`,
+  };
+}
+
+/**
+ * Sends a key or key combo to a specific window (or the active window).
+ * Uses hyprctl dispatch sendshortcut.
+ *
+ * Format: mods = "ctrl", "shift", "alt", "super" (comma-separated for multiple)
+ * key = XKB key name (e.g. "c", "Return", "Tab", "F5")
+ * Leave mods empty string "" for no modifiers.
+ *
+ * Window selector is optional — if omitted, targets the active window.
+ */
+export function sendKey(
+  mods: string,
+  key: string,
+  windowOpts?: { address?: string; class?: string; title?: string; pid?: number }
+): InputResult {
+  let winArg = "";
+  if (windowOpts && (windowOpts.address || windowOpts.class || windowOpts.title || windowOpts.pid)) {
+    const win = findWindow(windowOpts);
+    winArg = `,address:${win.address}`;
+  }
+
+  const shortcutArg = `${mods},${key}${winArg}`;
+  runHyprctlDispatch("sendshortcut", shortcutArg);
+
+  return {
+    success: true,
+    action: "send_key",
+    detail: `Sent key combo "${mods ? mods + "+" : ""}${key}"${winArg ? ` to window ${winArg}` : " to active window"}`,
+  };
+}
+
+/**
+ * Moves the cursor to (x, y) and performs a mouse click.
+ * button: "left" (1), "right" (3), "middle" (2).
+ * Uses hyprctl movecursor + ydotool.
+ */
+export function clickAt(x: number, y: number, button: "left" | "right" | "middle" = "left"): ClickResult {
+  // Move cursor to target position first
+  runHyprctlDispatch("movecursor", `${x} ${y}`);
+
+  const buttonMap: Record<string, string> = { left: "0x90001", right: "0x90002", middle: "0x90004" };
+  const btnCode = buttonMap[button];
+
+  // ydotool mousemove to confirm position, then click
+  runYdotool(["mousemove", "--absolute", "-x", String(x), "-y", String(y)]);
+  runYdotool(["click", btnCode]);
+
+  return { x, y, button };
+}
+
+/**
+ * Clicks the center of a window (with optional x/y offset from center).
+ * Optionally focuses the window first.
+ */
+export function clickWindow(
+  windowOpts: { address?: string; class?: string; title?: string; pid?: number },
+  options: { offset_x?: number; offset_y?: number; button?: "left" | "right" | "middle"; focus_first?: boolean } = {}
+): ClickResult {
+  const win = findWindow(windowOpts);
+  const [wx, wy] = win.at;
+  const [ww, wh] = win.size;
+
+  if (ww <= 0 || wh <= 0) {
+    throw new Error(
+      `Window "${win.class}" has invalid size ${ww}x${wh}. It may be minimized or hidden.`
+    );
+  }
+
+  if (options.focus_first) {
+    runHyprctlDispatch("focuswindow", `address:${win.address}`);
+    // Small delay to let focus settle
+    execFileSync("sleep", ["0.1"]);
+  }
+
+  const cx = wx + Math.floor(ww / 2) + (options.offset_x ?? 0);
+  const cy = wy + Math.floor(wh / 2) + (options.offset_y ?? 0);
+  const button = options.button ?? "left";
+
+  return clickAt(cx, cy, button);
+}
+
+/**
+ * Types a text string into the currently focused window using wtype.
+ * Optionally delays between keystrokes (ms).
+ */
+export function typeText(text: string, delayMs?: number): InputResult {
+  const args: string[] = [];
+  if (delayMs !== undefined && delayMs > 0) {
+    args.push("-d", String(delayMs));
+  }
+  args.push("--", text);
+
+  runWtype(args);
+
+  return {
+    success: true,
+    action: "type_text",
+    detail: `Typed ${text.length} character(s)`,
+  };
+}
+
+/**
+ * Presses a single special key by XKB name using wtype (e.g. "Return", "Tab", "Escape").
+ * For key combos with modifiers use sendKey instead.
+ */
+export function pressKey(key: string): InputResult {
+  runWtype(["-k", key]);
+
+  return {
+    success: true,
+    action: "press_key",
+    detail: `Pressed key "${key}"`,
+  };
 }

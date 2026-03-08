@@ -122,3 +122,20 @@ export interface WorkspaceInfo {
   last_window_address: string;
   last_window_title: string;
 }
+
+export interface CursorPos {
+  x: number;
+  y: number;
+}
+
+export interface ClickResult {
+  x: number;
+  y: number;
+  button: string;
+}
+
+export interface InputResult {
+  success: boolean;
+  action: string;
+  detail?: string;
+}
