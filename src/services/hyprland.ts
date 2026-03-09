@@ -455,9 +455,24 @@ export function sendKey(
 }
 
 /**
+ * Returns the window at the given screen coordinates on the *active* workspace.
+ * Filters out windows from inactive workspaces to avoid focus-stealing when
+ * multiple workspaces share the same screen coordinate space.
+ */
+function findWindowAtCoords(x: number, y: number): HyprlandWindow | undefined {
+  const monitors = listRawMonitors();
+  const activeWsId = monitors.find((m) => m.focused)?.activeWorkspace?.id;
+  const windows = listRawWindows().filter((w) => w.workspace.id === activeWsId);
+  return windows.find(
+    (w) => x >= w.at[0] && x < w.at[0] + w.size[0] && y >= w.at[1] && y < w.at[1] + w.size[1]
+  );
+}
+
+/**
  * Moves the cursor to (x, y) and performs a mouse click.
  * Automatically focuses the window under the target coordinates first so
  * keyboard input follows the click as expected in Hyprland.
+ * Only considers windows on the currently active workspace.
  *
  * button: "left" (1), "right" (3), "middle" (2).
  * skipFocus: set true when the caller has already focused the target window
@@ -472,11 +487,7 @@ export function clickAt(
   skipFocus = false
 ): ClickResult {
   if (!skipFocus) {
-    // Resolve the window that owns these coordinates and focus it
-    const windows = listRawWindows();
-    const target = windows.find(
-      (w) => x >= w.at[0] && x < w.at[0] + w.size[0] && y >= w.at[1] && y < w.at[1] + w.size[1]
-    );
+    const target = findWindowAtCoords(x, y);
     if (target) {
       runHyprctlDispatch("focuswindow", `address:${target.address}`);
       execFileSync("sleep", ["0.05"]);
@@ -576,10 +587,7 @@ export function doubleClickAt(
   skipFocus = false
 ): ClickResult {
   if (!skipFocus) {
-    const windows = listRawWindows();
-    const target = windows.find(
-      (w) => x >= w.at[0] && x < w.at[0] + w.size[0] && y >= w.at[1] && y < w.at[1] + w.size[1]
-    );
+    const target = findWindowAtCoords(x, y);
     if (target) {
       runHyprctlDispatch("focuswindow", `address:${target.address}`);
       execFileSync("sleep", ["0.05"]);
@@ -630,21 +638,39 @@ export function doubleClickWindow(
 /**
  * Switches to a workspace by numeric ID or name.
  * Uses hyprctl dispatch workspace, then verifies via monitor active workspace.
+ *
+ * Special Hyprland values like "previous", "+1", "-1" are passed through as-is.
+ * For these, verification only checks that the active workspace is defined (not
+ * a name/id match, since the resolved name will differ from the special value).
  */
 export function switchWorkspace(idOrName: number | string): InputResult {
+  const SPECIAL_NAMES = new Set(["previous"]);
+  const isSpecial =
+    typeof idOrName === "string" &&
+    (SPECIAL_NAMES.has(idOrName) || /^[+-]\d+$/.test(idOrName));
+
+  // Snapshot active workspace before dispatch (used for special-name verification)
+  const before = listRawMonitors().find((m) => m.focused)?.activeWorkspace;
+
   const target = String(idOrName);
   runHyprctlDispatch("workspace", target);
 
-  // Small settle delay then verify the active workspace changed
+  // Small settle delay then verify
   execFileSync("sleep", ["0.05"]);
   const monitors = listRawMonitors();
   const active = monitors.find((m) => m.focused)?.activeWorkspace;
 
-  const matched =
-    active !== undefined &&
-    (typeof idOrName === "number"
-      ? active.id === idOrName
-      : active.name === idOrName || active.id === Number(idOrName));
+  let matched: boolean;
+  if (isSpecial) {
+    // For special values just confirm compositor responded and workspace is defined
+    matched = active !== undefined && active.id !== before?.id;
+  } else {
+    matched =
+      active !== undefined &&
+      (typeof idOrName === "number"
+        ? active.id === idOrName
+        : active.name === idOrName || active.id === Number(idOrName));
+  }
 
   return {
     success: matched,
