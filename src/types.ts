@@ -132,6 +132,18 @@ export interface ClickResult {
   x: number;
   y: number;
   button: string;
+  coordinate_space?: "global";
+  target_window?: {
+    address: string;
+    class: string;
+    title: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    relative_x: number;
+    relative_y: number;
+  };
 }
 
 export interface InputResult {

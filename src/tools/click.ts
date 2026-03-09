@@ -5,21 +5,44 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { clickAt, clickWindow } from "../services/hyprland.js";
-import { WindowSelectorSchema } from "../schemas/index.js";
+import {
+  clickAt,
+  clickWindow,
+  clickWindowRelative,
+  findWindow,
+  getRawActiveWindow,
+  screenshotWindow,
+} from "../services/hyprland.js";
+import { WindowSelectorSchema, type WindowSelector } from "../schemas/index.js";
+import type { HyprlandWindow } from "../types.js";
 
 const ButtonSchema = z
   .enum(["left", "right", "middle"])
   .default("left")
   .describe("Mouse button to click: 'left' (default), 'right', or 'middle'");
 
-const ClickAtInputSchema = z
+const ClickAtInputBaseSchema = z
   .object({
     x: z.number().int().min(0).describe("Target X coordinate in global layout pixels"),
     y: z.number().int().min(0).describe("Target Y coordinate in global layout pixels"),
     button: ButtonSchema,
+    window: WindowSelectorSchema.optional().describe(
+      "Optional expected window selector for metadata and optional bounds validation."
+    ),
+    validate_bounds: z
+      .boolean()
+      .default(false)
+      .describe(
+        "If true and window selector is provided, fail when (x,y) is outside selected window bounds."
+      ),
   })
   .strict();
+
+const ClickAtInputSchema = ClickAtInputBaseSchema
+  .refine((data) => !data.window || hasWindowSelector(data.window), {
+    message:
+      "When 'window' is provided, include at least one selector: address, class, title, or pid.",
+  });
 
 const ClickWindowInputSchema = WindowSelectorSchema.extend({
   button: ButtonSchema,
@@ -50,6 +73,77 @@ const ClickWindowInputSchema = WindowSelectorSchema.extend({
 
 type ClickAtInput = z.infer<typeof ClickAtInputSchema>;
 type ClickWindowInput = z.infer<typeof ClickWindowInputSchema>;
+
+const ClickWindowRelativeInputSchema = WindowSelectorSchema.extend({
+  local_x: z
+    .number()
+    .int()
+    .describe("Target X coordinate relative to the window's top-left corner (local pixels)."),
+  local_y: z
+    .number()
+    .int()
+    .describe("Target Y coordinate relative to the window's top-left corner (local pixels)."),
+  button: ButtonSchema,
+  focus_first: z
+    .boolean()
+    .default(true)
+    .describe("Focus the window before clicking (default: true)."),
+  validate_bounds: z
+    .boolean()
+    .default(true)
+    .describe("If true (default), fail when local coordinates are outside window bounds."),
+})
+  .strict()
+  .refine((data) => data.address || data.class || data.title || data.pid, {
+    message:
+      "At least one window selector is required: address, class, title, or pid. " +
+      "Use hyprland_list_windows to discover available windows.",
+  });
+
+type ClickWindowRelativeInput = z.infer<typeof ClickWindowRelativeInputSchema>;
+
+const ClickAndScreenshotInputSchema = ClickAtInputBaseSchema.extend({
+  include_image: z
+    .boolean()
+    .default(true)
+    .describe("Include post-click screenshot image in the response (default: true)."),
+  retries: z
+    .number()
+    .int()
+    .min(0)
+    .max(4)
+    .default(0)
+    .describe("Number of additional nudge attempts after the first click (0-4)."),
+  nudge_px: z
+    .number()
+    .int()
+    .min(1)
+    .max(64)
+    .default(8)
+    .describe("Nudge distance in pixels for fallback attempts (default: 8)."),
+  require_focus_match: z
+    .boolean()
+    .default(true)
+    .describe(
+      "If window selector is provided, require active window to match selector after click before returning success."
+    ),
+})
+  .strict()
+  .refine((data) => !data.window || hasWindowSelector(data.window), {
+    message:
+      "When 'window' is provided, include at least one selector: address, class, title, or pid.",
+  });
+
+type ClickAndScreenshotInput = z.infer<typeof ClickAndScreenshotInputSchema>;
+
+function hasWindowSelector(selector?: WindowSelector): boolean {
+  if (!selector) return false;
+  return Boolean(selector.address || selector.class || selector.title || selector.pid);
+}
+
+function isInsideWindow(window: HyprlandWindow, x: number, y: number): boolean {
+  return x >= window.at[0] && x < window.at[0] + window.size[0] && y >= window.at[1] && y < window.at[1] + window.size[1];
+}
 
 export function registerClick(server: McpServer): void {
   // --- hyprland_click_at ---
@@ -95,16 +189,45 @@ Error cases:
     },
     async (params: ClickAtInput) => {
       try {
-        const result = clickAt(params.x, params.y, params.button);
+        const expectedWindow = hasWindowSelector(params.window)
+          ? findWindow({
+              address: params.window?.address,
+              class: params.window?.class,
+              title: params.window?.title,
+              pid: params.window?.pid,
+            })
+          : undefined;
+
+        if (params.validate_bounds && expectedWindow && !isInsideWindow(expectedWindow, params.x, params.y)) {
+          throw new Error(
+            `Global point (${params.x}, ${params.y}) is outside expected window bounds ` +
+              `${expectedWindow.at[0]},${expectedWindow.at[1]} ${expectedWindow.size[0]}x${expectedWindow.size[1]} ` +
+              `for "${expectedWindow.class}". Coordinates for hyprland_click_at are global.`
+          );
+        }
+
+        const result = clickAt(params.x, params.y, params.button, false, expectedWindow);
+
+        const targetWindowSuffix = result.target_window
+          ? ` | target=${result.target_window.class} (${result.target_window.address}) local=(${result.target_window.relative_x},${result.target_window.relative_y})`
+          : "";
 
         return {
           content: [
             {
               type: "text",
-              text: `${result.button} click at x=${result.x}, y=${result.y}`,
+              text:
+                `${result.button} click at global x=${result.x}, y=${result.y} ` +
+                `(coordinate_space=${result.coordinate_space ?? "global"})${targetWindowSuffix}`,
             },
           ],
-          structuredContent: { x: result.x, y: result.y, button: result.button },
+          structuredContent: {
+            x: result.x,
+            y: result.y,
+            button: result.button,
+            coordinate_space: result.coordinate_space ?? "global",
+            target_window: result.target_window,
+          },
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -196,6 +319,222 @@ Error cases:
           content: [{ type: "text", text: `Error: ${msg}` }],
         };
       }
+    }
+  );
+
+  // --- hyprland_click_window_relative ---
+  server.registerTool(
+    "hyprland_click_window_relative",
+    {
+      title: "Click Window Relative Coordinates",
+      description: `Click inside a specific window using coordinates relative to that window.
+
+This avoids global-coordinate mistakes when using hyprland_screenshot_window output.
+Given a local point (local_x, local_y), this tool converts to global coordinates:
+  global_x = window_x + local_x
+  global_y = window_y + local_y
+
+Args:
+  - address|class|title|pid: Window selector (one required)
+  - local_x (number): X in window-local pixels
+  - local_y (number): Y in window-local pixels
+  - button ('left' | 'right' | 'middle'): Mouse button (default: 'left')
+  - focus_first (boolean): Focus window before click (default: true)
+  - validate_bounds (boolean): Ensure local point is inside window bounds (default: true)
+
+Returns click metadata including global coordinates and local coordinates.
+`,
+      inputSchema: ClickWindowRelativeInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (params: ClickWindowRelativeInput) => {
+      try {
+        const result = clickWindowRelative(
+          {
+            address: params.address,
+            class: params.class,
+            title: params.title,
+            pid: params.pid,
+          },
+          params.local_x,
+          params.local_y,
+          {
+            button: params.button,
+            focus_first: params.focus_first,
+            validate_bounds: params.validate_bounds,
+          }
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${result.button} click from local coordinates succeeded: ` +
+                `global=(${result.x},${result.y}) ` +
+                `local=(${result.target_window?.relative_x ?? "?"},${result.target_window?.relative_y ?? "?"}) ` +
+                `(coordinate_space=${result.coordinate_space ?? "global"})`,
+            },
+          ],
+          structuredContent: {
+            x: result.x,
+            y: result.y,
+            button: result.button,
+            coordinate_space: result.coordinate_space ?? "global",
+            target_window: result.target_window,
+          },
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error: ${msg}` }],
+        };
+      }
+    }
+  );
+
+  // --- hyprland_click_and_screenshot_active ---
+  server.registerTool(
+    "hyprland_click_and_screenshot_active",
+    {
+      title: "Click and Screenshot Active Window",
+      description: `Execute click-at with optional bounded retries, then capture the active window screenshot.
+
+This helper implements a practical click → verify loop:
+1) click at global coordinates
+2) optionally retry nearby nudged points if focus does not match expected window
+3) capture and return active-window screenshot for visual verification
+
+When 'window' selector is provided and 'require_focus_match=true', the tool only succeeds
+when the active window matches the selected window.
+`,
+      inputSchema: ClickAndScreenshotInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (params: ClickAndScreenshotInput) => {
+      const expectedWindow = hasWindowSelector(params.window)
+        ? findWindow({
+            address: params.window?.address,
+            class: params.window?.class,
+            title: params.window?.title,
+            pid: params.window?.pid,
+          })
+        : undefined;
+
+      const n = params.nudge_px;
+      const offsets: Array<[number, number]> = [
+        [0, 0],
+        [-n, 0],
+        [n, 0],
+        [0, -n],
+        [0, n],
+      ];
+      const maxAttempts = Math.min(params.retries + 1, offsets.length);
+
+      let lastError: string | undefined;
+      for (let i = 0; i < maxAttempts; i += 1) {
+        const [dx, dy] = offsets[i];
+        const clickX = params.x + dx;
+        const clickY = params.y + dy;
+
+        try {
+          if (params.validate_bounds && expectedWindow && !isInsideWindow(expectedWindow, clickX, clickY)) {
+            lastError =
+              `Attempt ${i + 1}: point (${clickX}, ${clickY}) outside expected window bounds ` +
+              `${expectedWindow.at[0]},${expectedWindow.at[1]} ${expectedWindow.size[0]}x${expectedWindow.size[1]}`;
+            continue;
+          }
+
+          const clickResult = clickAt(clickX, clickY, params.button, false, expectedWindow);
+          const active = getRawActiveWindow();
+
+          if (expectedWindow && params.require_focus_match && active?.address !== expectedWindow.address) {
+            lastError =
+              `Attempt ${i + 1}: active window mismatch after click. ` +
+              `Expected ${expectedWindow.address}, got ${active?.address ?? "none"}.`;
+            continue;
+          }
+
+          if (!active) {
+            lastError = `Attempt ${i + 1}: no active window after click.`;
+            continue;
+          }
+
+          const shot = screenshotWindow(active);
+          const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+            {
+              type: "text",
+              text: [
+                `click+capture succeeded on attempt ${i + 1}/${maxAttempts}`,
+                `click_global=(${clickResult.x},${clickResult.y})`,
+                `coordinate_space=${clickResult.coordinate_space ?? "global"}`,
+                `active_window=${active.class} (${active.address})`,
+                `screenshot=${shot.file_path}`,
+              ].join("\n"),
+            },
+          ];
+
+          if (params.include_image) {
+            content.push({
+              type: "image",
+              data: shot.base64_image,
+              mimeType: "image/png",
+            });
+          }
+
+          return {
+            content,
+            structuredContent: {
+              attempt: i + 1,
+              attempts_total: maxAttempts,
+              click: {
+                x: clickResult.x,
+                y: clickResult.y,
+                button: clickResult.button,
+                coordinate_space: clickResult.coordinate_space ?? "global",
+                target_window: clickResult.target_window,
+              },
+              active_window: {
+                address: active.address,
+                class: active.class,
+                title: active.title,
+              },
+              screenshot: {
+                window_address: shot.window_address,
+                window_class: shot.window_class,
+                window_title: shot.window_title,
+                geometry: shot.geometry,
+                file_path: shot.file_path,
+                width: shot.width,
+                height: shot.height,
+              },
+            },
+          };
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Error: click+capture failed after ${maxAttempts} attempt(s). ${lastError ?? "Unknown error."}`,
+          },
+        ],
+      };
     }
   );
 }

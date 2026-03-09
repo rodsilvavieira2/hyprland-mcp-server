@@ -57,6 +57,8 @@ npm run dev
 | `hyprland_list_workspaces` | List workspaces with window counts and monitor assignments |
 | `hyprland_click_at` | Simulates a mouse click at absolute global coordinates in Hyprland. Useful for programmatically interacting with specific screen positions. |
 | `hyprland_click_window` | Targets the center of a specific window in Hyprland for a mouse click, with optional offsets. |
+| `hyprland_click_window_relative` | Clicks inside a selected window using window-local coordinates (`local_x`,`local_y`) with optional bounds validation. |
+| `hyprland_click_and_screenshot_active` | Performs click with optional bounded retries and returns active-window screenshot for immediate verification. |
 | `hyprland_move_cursor` | Moves the mouse cursor to specified global coordinates without clicking. |
 | `hyprland_get_cursor_pos` | Retrieves the current cursor position in the global layout coordinates. |
 | `hyprland_type_text` | Types a text string into the currently focused window using Wayland-native input injection. |
@@ -88,6 +90,23 @@ Screenshot tools return:
 - A **structuredContent** block with JSON metadata
 
 Screenshots are saved to a temporary directory under `/tmp/hyprland-mcp-*`.
+
+## Click Precision Notes
+
+- `hyprland_click_at` expects **global monitor coordinates**.
+- `hyprland_screenshot_window` is naturally read as **window-local** pixels.
+- Convert local → global when needed:
+
+```text
+global_x = window_x + local_x
+global_y = window_y + local_y
+```
+
+To avoid coordinate-space mistakes, prefer:
+
+1. `hyprland_click_window_relative` when targeting UI points from a window screenshot.
+2. `hyprland_click_window` when clicking near window center with offsets.
+3. `hyprland_click_and_screenshot_active` when you want click+verify loop in one call.
 
 ## Development
 

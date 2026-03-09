@@ -454,6 +454,24 @@ export function sendKey(
   };
 }
 
+function isPointInsideWindow(window: HyprlandWindow, x: number, y: number): boolean {
+  return x >= window.at[0] && x < window.at[0] + window.size[0] && y >= window.at[1] && y < window.at[1] + window.size[1];
+}
+
+function mapTargetWindowForClick(window: HyprlandWindow, x: number, y: number): NonNullable<ClickResult["target_window"]> {
+  return {
+    address: window.address,
+    class: window.class,
+    title: window.title,
+    x: window.at[0],
+    y: window.at[1],
+    width: window.size[0],
+    height: window.size[1],
+    relative_x: x - window.at[0],
+    relative_y: y - window.at[1],
+  };
+}
+
 /**
  * Returns the window at the given screen coordinates on the *active* workspace.
  * Filters out windows from inactive workspaces to avoid focus-stealing when
@@ -484,10 +502,13 @@ export function clickAt(
   x: number,
   y: number,
   button: "left" | "right" | "middle" = "left",
-  skipFocus = false
+  skipFocus = false,
+  expectedWindow?: HyprlandWindow
 ): ClickResult {
+  const targetForMetadata = expectedWindow ?? findWindowAtCoords(x, y);
+
   if (!skipFocus) {
-    const target = findWindowAtCoords(x, y);
+    const target = targetForMetadata;
     if (target) {
       runHyprctlDispatch("focuswindow", `address:${target.address}`);
       execFileSync("sleep", ["0.05"]);
@@ -501,7 +522,13 @@ export function clickAt(
   runYdotool(["mousemove", "--absolute", "-x", String(x), "-y", String(y)]);
   runYdotool(["click", buttonMap[button]]);
 
-  return { x, y, button };
+  return {
+    x,
+    y,
+    button,
+    coordinate_space: "global",
+    target_window: targetForMetadata ? mapTargetWindowForClick(targetForMetadata, x, y) : undefined,
+  };
 }
 
 /**
@@ -532,7 +559,50 @@ export function clickWindow(
   const cy = wy + Math.floor(wh / 2) + (options.offset_y ?? 0);
 
   // skipFocus=true — window is already focused above
-  return clickAt(cx, cy, options.button ?? "left", true);
+  return clickAt(cx, cy, options.button ?? "left", true, win);
+}
+
+/**
+ * Clicks a point in a window using window-relative coordinates (local_x/local_y).
+ * This avoids global coordinate confusion when using per-window screenshots.
+ */
+export function clickWindowRelative(
+  windowOpts: { address?: string; class?: string; title?: string; pid?: number },
+  localX: number,
+  localY: number,
+  options: {
+    button?: "left" | "right" | "middle";
+    focus_first?: boolean;
+    validate_bounds?: boolean;
+  } = {}
+): ClickResult {
+  const win = findWindow(windowOpts);
+  const [wx, wy] = win.at;
+  const [ww, wh] = win.size;
+
+  if (ww <= 0 || wh <= 0) {
+    throw new Error(
+      `Window "${win.class}" has invalid size ${ww}x${wh}. It may be minimized or hidden.`
+    );
+  }
+
+  const validateBounds = options.validate_bounds !== false;
+  const gx = wx + localX;
+  const gy = wy + localY;
+
+  if (validateBounds && !isPointInsideWindow(win, gx, gy)) {
+    throw new Error(
+      `Window-relative point (${localX}, ${localY}) is outside window bounds (0..${ww - 1}, 0..${wh - 1}) for ` +
+        `"${win.class}" at ${wx},${wy} ${ww}x${wh}.`
+    );
+  }
+
+  if (options.focus_first !== false) {
+    runHyprctlDispatch("focuswindow", `address:${win.address}`);
+    execFileSync("sleep", ["0.05"]);
+  }
+
+  return clickAt(gx, gy, options.button ?? "left", true, win);
 }
 
 /**
@@ -602,7 +672,7 @@ export function doubleClickAt(
   execFileSync("sleep", ["0.05"]);
   runYdotool(["click", buttonMap[button]]);
 
-  return { x, y, button };
+  return { x, y, button, coordinate_space: "global" };
 }
 
 /**
