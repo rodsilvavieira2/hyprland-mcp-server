@@ -74,6 +74,7 @@ Error cases:
           success: result.success,
           action: result.action,
           detail: result.detail,
+          active_window: result.active_window,
         };
 
         return {

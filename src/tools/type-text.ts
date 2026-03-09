@@ -24,6 +24,13 @@ const TypeTextInputSchema = z
         "Delay between keystrokes in milliseconds (optional). " +
         "Useful for applications that can't handle fast input. Typical value: 20-50."
       ),
+    move_to: z
+      .enum(["start", "end"])
+      .optional()
+      .describe(
+        "Move cursor before typing: 'start' = Ctrl+Home (beginning of document), " +
+        "'end' = Ctrl+End (end of document). Omit to type at current cursor position."
+      ),
   })
   .strict();
 
@@ -62,6 +69,9 @@ Args:
   - text (string): Text to type. Max 10000 characters. Unicode supported.
   - delay_ms (number, optional): Milliseconds between keystrokes (0-5000).
     Use 20-50ms for applications that drop keystrokes at full speed.
+  - move_to ('start' | 'end', optional): Move cursor before typing.
+    'start' = Ctrl+Home (beginning of document), 'end' = Ctrl+End (end of document).
+    Omit to type at the current cursor position.
 
 Returns:
   {
@@ -72,6 +82,8 @@ Returns:
 
 Examples:
   - "Type hello world into the terminal" → text="hello world"
+  - "Append text at end of file" → text="new line", move_to="end"
+  - "Insert at beginning of document" → text="prefix", move_to="start"
   - "Fill in a search box" → focus window first, then text="search query"
   - "Type slowly for a laggy app" → text="my input", delay_ms=30
   - "Type a newline" → use hyprland_press_key with key="Return" instead
@@ -88,7 +100,7 @@ Error cases:
     },
     async (params: TypeTextInput) => {
       try {
-        const result = typeText(params.text, params.delay_ms);
+        const result = typeText(params.text, params.delay_ms, params.move_to);
 
         return {
           content: [{ type: "text", text: result.detail ?? "Text typed." }],

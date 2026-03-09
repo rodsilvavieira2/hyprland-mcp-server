@@ -138,4 +138,5 @@ export interface InputResult {
   success: boolean;
   action: string;
   detail?: string;
+  active_window?: { address: string; class: string; title: string };
 }

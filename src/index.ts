@@ -44,7 +44,9 @@ import { registerGetCursorPos } from "./tools/get-cursor-pos.js";
 import { registerMoveCursor } from "./tools/move-cursor.js";
 import { registerSendKey } from "./tools/send-key.js";
 import { registerClick } from "./tools/click.js";
+import { registerDoubleClick } from "./tools/double-click.js";
 import { registerTypeText } from "./tools/type-text.js";
+import { registerSwitchWorkspace } from "./tools/switch-workspace.js";
 
 // ---------------------------------------------------------------------------
 // Dependency check
@@ -97,7 +99,9 @@ registerGetCursorPos(server);
 registerMoveCursor(server);
 registerSendKey(server);
 registerClick(server);
+registerDoubleClick(server);
 registerTypeText(server);
+registerSwitchWorkspace(server);
 
 // ---------------------------------------------------------------------------
 // Start stdio transport

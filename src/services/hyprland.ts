@@ -36,6 +36,16 @@ function runHyprctl(subcommand: string, extra: string[] = []): string {
   }
 }
 
+/** Returns the scale factor of a monitor by its ID. Defaults to 1.0 if not found. */
+function getMonitorScale(monitorId: number): number {
+  try {
+    const monitors = JSON.parse(runHyprctl("monitors")) as HyprlandMonitor[];
+    return monitors.find((m) => m.id === monitorId)?.scale ?? 1.0;
+  } catch {
+    return 1.0;
+  }
+}
+
 function runGrim(geometry: string, outputPath: string): void {
   try {
     // grim -g "x,y WxH" <output_file>
@@ -231,6 +241,7 @@ export function findWindow(opts: {
 
 /**
  * Captures a screenshot of a specific window using its geometry.
+ * Applies monitor scale factor so grim receives physical-pixel coordinates.
  * The window must be mapped and visible on screen.
  */
 export function screenshotWindow(window: HyprlandWindow): ScreenshotResult {
@@ -243,7 +254,14 @@ export function screenshotWindow(window: HyprlandWindow): ScreenshotResult {
     );
   }
 
-  const geometry = geometryString(x, y, w, h);
+  const scale = getMonitorScale(window.monitor);
+  const geometry = geometryString(
+    Math.round(x * scale),
+    Math.round(y * scale),
+    Math.round(w * scale),
+    Math.round(h * scale)
+  );
+
   return captureGeometry(geometry, window);
 }
 
@@ -376,6 +394,7 @@ export function moveCursor(x: number, y: number): CursorPos {
 /**
  * Focuses a window by address, class, title or pid.
  * Uses hyprctl dispatch focuswindow.
+ * Returns the resulting active window state to confirm focus changed.
  */
 export function focusWindow(opts: {
   address?: string;
@@ -385,14 +404,22 @@ export function focusWindow(opts: {
 }): InputResult {
   const win = findWindow(opts);
 
-  // Build focuswindow argument — address is most reliable
-  const arg = `address:${win.address}`;
-  runHyprctlDispatch("focuswindow", arg);
+  runHyprctlDispatch("focuswindow", `address:${win.address}`);
+
+  // Small settle delay then verify focus actually changed
+  execFileSync("sleep", ["0.05"]);
+  const active = getRawActiveWindow();
+  const focused = active?.address === win.address;
 
   return {
-    success: true,
+    success: focused,
     action: "focus_window",
-    detail: `Focused window "${win.class}" (${win.title}) at address ${win.address}`,
+    detail: focused
+      ? `Focused window "${win.class}" (${win.title}) at address ${win.address}`
+      : `Focus dispatch sent but active window is now "${active?.class ?? "unknown"}" — may be on a different workspace`,
+    active_window: active
+      ? { address: active.address, class: active.class, title: active.title }
+      : undefined,
   };
 }
 
@@ -429,26 +456,47 @@ export function sendKey(
 
 /**
  * Moves the cursor to (x, y) and performs a mouse click.
+ * Automatically focuses the window under the target coordinates first so
+ * keyboard input follows the click as expected in Hyprland.
+ *
  * button: "left" (1), "right" (3), "middle" (2).
+ * skipFocus: set true when the caller has already focused the target window
+ *            (e.g. clickWindow) to avoid a redundant focus dispatch.
+ *
  * Uses hyprctl movecursor + ydotool.
  */
-export function clickAt(x: number, y: number, button: "left" | "right" | "middle" = "left"): ClickResult {
-  // Move cursor to target position first
+export function clickAt(
+  x: number,
+  y: number,
+  button: "left" | "right" | "middle" = "left",
+  skipFocus = false
+): ClickResult {
+  if (!skipFocus) {
+    // Resolve the window that owns these coordinates and focus it
+    const windows = listRawWindows();
+    const target = windows.find(
+      (w) => x >= w.at[0] && x < w.at[0] + w.size[0] && y >= w.at[1] && y < w.at[1] + w.size[1]
+    );
+    if (target) {
+      runHyprctlDispatch("focuswindow", `address:${target.address}`);
+      execFileSync("sleep", ["0.05"]);
+    }
+  }
+
+  // Move cursor then fire click
   runHyprctlDispatch("movecursor", `${x} ${y}`);
 
   const buttonMap: Record<string, string> = { left: "0x90001", right: "0x90002", middle: "0x90004" };
-  const btnCode = buttonMap[button];
-
-  // ydotool mousemove to confirm position, then click
   runYdotool(["mousemove", "--absolute", "-x", String(x), "-y", String(y)]);
-  runYdotool(["click", btnCode]);
+  runYdotool(["click", buttonMap[button]]);
 
   return { x, y, button };
 }
 
 /**
  * Clicks the center of a window (with optional x/y offset from center).
- * Optionally focuses the window first.
+ * Focuses the window first (default), then delegates to clickAt with
+ * skipFocus=true to avoid a redundant second focus dispatch.
  */
 export function clickWindow(
   windowOpts: { address?: string; class?: string; title?: string; pid?: number },
@@ -464,24 +512,27 @@ export function clickWindow(
     );
   }
 
-  if (options.focus_first) {
+  if (options.focus_first !== false) {
     runHyprctlDispatch("focuswindow", `address:${win.address}`);
-    // Small delay to let focus settle
-    execFileSync("sleep", ["0.1"]);
+    execFileSync("sleep", ["0.05"]);
   }
 
   const cx = wx + Math.floor(ww / 2) + (options.offset_x ?? 0);
   const cy = wy + Math.floor(wh / 2) + (options.offset_y ?? 0);
-  const button = options.button ?? "left";
 
-  return clickAt(cx, cy, button);
+  // skipFocus=true — window is already focused above
+  return clickAt(cx, cy, options.button ?? "left", true);
 }
 
 /**
  * Types a text string into the currently focused window using wtype.
+ * moveTo: optionally navigate to "start" (Ctrl+Home) or "end" (Ctrl+End) before typing.
  * Optionally delays between keystrokes (ms).
  */
-export function typeText(text: string, delayMs?: number): InputResult {
+export function typeText(text: string, delayMs?: number, moveTo?: "start" | "end"): InputResult {
+  if (moveTo === "start") runWtype(["-M", "ctrl", "-k", "Home", "-m", "ctrl"]);
+  if (moveTo === "end")   runWtype(["-M", "ctrl", "-k", "End",  "-m", "ctrl"]);
+
   const args: string[] = [];
   if (delayMs !== undefined && delayMs > 0) {
     args.push("-d", String(delayMs));
@@ -493,7 +544,7 @@ export function typeText(text: string, delayMs?: number): InputResult {
   return {
     success: true,
     action: "type_text",
-    detail: `Typed ${text.length} character(s)`,
+    detail: `Typed ${text.length} character(s)${moveTo ? ` (cursor moved to ${moveTo} first)` : ""}`,
   };
 }
 
@@ -508,5 +559,98 @@ export function pressKey(key: string): InputResult {
     success: true,
     action: "press_key",
     detail: `Pressed key "${key}"`,
+  };
+}
+
+/**
+ * Moves the cursor to (x, y) and performs a double mouse click.
+ * Fires two clicks with a short pause between them.
+ *
+ * button: "left" (1), "right" (3), "middle" (2).
+ * skipFocus: set true when the caller has already focused the target window.
+ */
+export function doubleClickAt(
+  x: number,
+  y: number,
+  button: "left" | "right" | "middle" = "left",
+  skipFocus = false
+): ClickResult {
+  if (!skipFocus) {
+    const windows = listRawWindows();
+    const target = windows.find(
+      (w) => x >= w.at[0] && x < w.at[0] + w.size[0] && y >= w.at[1] && y < w.at[1] + w.size[1]
+    );
+    if (target) {
+      runHyprctlDispatch("focuswindow", `address:${target.address}`);
+      execFileSync("sleep", ["0.05"]);
+    }
+  }
+
+  runHyprctlDispatch("movecursor", `${x} ${y}`);
+
+  const buttonMap: Record<string, string> = { left: "0x90001", right: "0x90002", middle: "0x90004" };
+  runYdotool(["mousemove", "--absolute", "-x", String(x), "-y", String(y)]);
+  runYdotool(["click", buttonMap[button]]);
+  execFileSync("sleep", ["0.05"]);
+  runYdotool(["click", buttonMap[button]]);
+
+  return { x, y, button };
+}
+
+/**
+ * Double-clicks the center of a window (with optional x/y offset from center).
+ * Focuses the window first (default), then delegates to doubleClickAt with
+ * skipFocus=true to avoid a redundant second focus dispatch.
+ */
+export function doubleClickWindow(
+  windowOpts: { address?: string; class?: string; title?: string; pid?: number },
+  options: { offset_x?: number; offset_y?: number; button?: "left" | "right" | "middle"; focus_first?: boolean } = {}
+): ClickResult {
+  const win = findWindow(windowOpts);
+  const [wx, wy] = win.at;
+  const [ww, wh] = win.size;
+
+  if (ww <= 0 || wh <= 0) {
+    throw new Error(
+      `Window "${win.class}" has invalid size ${ww}x${wh}. It may be minimized or hidden.`
+    );
+  }
+
+  if (options.focus_first !== false) {
+    runHyprctlDispatch("focuswindow", `address:${win.address}`);
+    execFileSync("sleep", ["0.05"]);
+  }
+
+  const cx = wx + Math.floor(ww / 2) + (options.offset_x ?? 0);
+  const cy = wy + Math.floor(wh / 2) + (options.offset_y ?? 0);
+
+  return doubleClickAt(cx, cy, options.button ?? "left", true);
+}
+
+/**
+ * Switches to a workspace by numeric ID or name.
+ * Uses hyprctl dispatch workspace, then verifies via monitor active workspace.
+ */
+export function switchWorkspace(idOrName: number | string): InputResult {
+  const target = String(idOrName);
+  runHyprctlDispatch("workspace", target);
+
+  // Small settle delay then verify the active workspace changed
+  execFileSync("sleep", ["0.05"]);
+  const monitors = listRawMonitors();
+  const active = monitors.find((m) => m.focused)?.activeWorkspace;
+
+  const matched =
+    active !== undefined &&
+    (typeof idOrName === "number"
+      ? active.id === idOrName
+      : active.name === idOrName || active.id === Number(idOrName));
+
+  return {
+    success: matched,
+    action: "switch_workspace",
+    detail: matched
+      ? `Switched to workspace "${active!.name}" (id ${active!.id})`
+      : `Dispatch sent but active workspace is now "${active?.name ?? "unknown"}" (id ${active?.id ?? "?"})`,
   };
 }
